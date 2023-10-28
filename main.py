@@ -2,9 +2,10 @@ import os
 import jwt
 import databases
 import sqlalchemy
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from collections import defaultdict
 from dotenv import load_dotenv
 from icecream import ic
 
@@ -113,3 +114,105 @@ async def delete_whiteboard(request: Request, id: int):
         whiteboards.c.id == id and whiteboards.c.owner == username
     )
     return await database.execute(query)
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def send_personal_message(self, message: dict, websocket: WebSocket):
+        await websocket.send_json(message)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            await connection.send_json(message)
+
+
+manager = ConnectionManager()
+whiteboard_lines = defaultdict(list)
+chat = defaultdict(list)
+
+
+@app.websocket("/whiteboard/{id}")
+async def whiteboard(ws: WebSocket, id: int):
+    await ws.accept()
+    first_data = await ws.receive_json()
+    if first_data["type"] != "auth":
+        await ws.send_json({"type": "error", "message": "Missing auth"})
+        await ws.close()
+        return
+
+    token = first_data.get("token")
+    if not token:
+        await ws.send_json({"type": "error", "message": "Missing token"})
+        await ws.close()
+        return
+    public_key = os.environ.get("KEYCLOAK_PUBLIC_KEY")
+    public_key = f"-----BEGIN PUBLIC KEY-----\n{public_key}\n-----END PUBLIC KEY-----"
+
+    try:
+        user = jwt.decode(token, public_key, algorithms=["RS256"], audience="account")
+    except jwt.exceptions.PyJWTError:
+        await ws.send_json({"type": "error", "message": "Invalid token"})
+        await ws.close()
+        return
+
+    await manager.connect(ws)
+    await manager.broadcast({"type": "join", "user": user["preferred_username"]})
+    await manager.send_personal_message(
+        {"type": "lines", "lines": whiteboard_lines[id]}, ws
+    )
+    await manager.send_personal_message({"type": "chat_history", "chat": chat[id]}, ws)
+    try:
+        while True:
+            data = await ws.receive_json()
+            if data.get("type") == "lines" and data.get("lines"):
+                await manager.broadcast(
+                    {
+                        "type": "lines",
+                        "user": user["preferred_username"],
+                        "lines": data["lines"],
+                    }
+                )
+                whiteboard_lines[id] = data["lines"]
+            if data.get("type") == "mouse" and data.get("x") and data.get("y"):
+                try:
+                    int(data["x"])
+                    int(data["y"])
+                except ValueError:
+                    continue
+                await manager.broadcast(
+                    {
+                        "type": "mouse",
+                        "user": user["preferred_username"],
+                        "x": data["x"],
+                        "y": data["y"],
+                    }
+                )
+            if data.get("type") == "tool" and data.get("tool"):
+                if data["tool"] not in ["pen", "eraser", "select"]:
+                    continue
+                await manager.broadcast(
+                    {
+                        "type": "tool",
+                        "user": user["preferred_username"],
+                        "tool": data["tool"],
+                    }
+                )
+            if data.get("type") == "chat" and data.get("message"):
+                await manager.broadcast(
+                    {
+                        "type": "chat",
+                        "user": user["preferred_username"],
+                        "message": data["message"],
+                    }
+                )
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
+        await manager.broadcast({"type": "leave", "user": user["preferred_username"]})
