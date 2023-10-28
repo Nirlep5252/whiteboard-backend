@@ -7,3 +7,5 @@ python-dotenv
 databases
 icecream
 websockets
+asyncpg
+psycopg2
