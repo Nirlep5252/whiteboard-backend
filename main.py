@@ -1,4 +1,5 @@
 import os
+from typing import Dict, List
 import jwt
 import databases
 import sqlalchemy
@@ -118,25 +119,26 @@ async def delete_whiteboard(request: Request, id: int):
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: Dict[int, List[WebSocket]] = defaultdict(list)
 
-    async def connect(self, websocket: WebSocket):
-        self.active_connections.append(websocket)
+    async def connect(self, websocket: WebSocket, board_id: int):
+        self.active_connections[board_id].append(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def disconnect(self, websocket: WebSocket, board_id: int):
+        self.active_connections[board_id].remove(websocket)
 
-    async def send_personal_message(self, message: dict, websocket: WebSocket):
+    async def send_personal_message(
+        self, message: Dict[str, str], websocket: WebSocket
+    ):
         await websocket.send_json(message)
 
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+    async def broadcast(self, message: Dict[str, str], board_id: int):
+        for connection in self.active_connections[board_id]:
             await connection.send_json(message)
 
 
 manager = ConnectionManager()
 whiteboard_lines = defaultdict(list)
-chat = defaultdict(list)
 
 
 @app.websocket("/whiteboard/{id}")
@@ -163,12 +165,12 @@ async def whiteboard(ws: WebSocket, id: int):
         await ws.close()
         return
 
-    await manager.connect(ws)
-    await manager.broadcast({"type": "join", "user": user["preferred_username"]})
+    await manager.connect(ws, id)
+    await manager.broadcast({"type": "join", "user": user["preferred_username"]}, id)
     await manager.send_personal_message(
         {"type": "lines", "lines": whiteboard_lines[id]}, ws
     )
-    await manager.send_personal_message({"type": "chat_history", "chat": chat[id]}, ws)
+    # await manager.send_personal_message({"type": "chat_history", "chat": chat[id]}, ws)
     try:
         while True:
             data = await ws.receive_json()
@@ -178,7 +180,8 @@ async def whiteboard(ws: WebSocket, id: int):
                         "type": "lines",
                         "user": user["preferred_username"],
                         "lines": data["lines"],
-                    }
+                    },
+                    id,
                 )
                 whiteboard_lines[id] = data["lines"]
             if data.get("type") == "mouse" and data.get("x") and data.get("y"):
@@ -193,7 +196,8 @@ async def whiteboard(ws: WebSocket, id: int):
                         "user": user["preferred_username"],
                         "x": data["x"],
                         "y": data["y"],
-                    }
+                    },
+                    id,
                 )
             if data.get("type") == "tool" and data.get("tool"):
                 if data["tool"] not in ["pen", "eraser", "select"]:
@@ -203,7 +207,8 @@ async def whiteboard(ws: WebSocket, id: int):
                         "type": "tool",
                         "user": user["preferred_username"],
                         "tool": data["tool"],
-                    }
+                    },
+                    id,
                 )
             if data.get("type") == "chat" and data.get("message"):
                 await manager.broadcast(
@@ -211,8 +216,11 @@ async def whiteboard(ws: WebSocket, id: int):
                         "type": "chat",
                         "user": user["preferred_username"],
                         "message": data["message"],
-                    }
+                    },
+                    id,
                 )
     except WebSocketDisconnect:
-        manager.disconnect(ws)
-        await manager.broadcast({"type": "leave", "user": user["preferred_username"]})
+        manager.disconnect(ws, id)
+        await manager.broadcast(
+            {"type": "leave", "user": user["preferred_username"]}, id
+        )
