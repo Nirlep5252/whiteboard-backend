@@ -1,14 +1,18 @@
 import os
-from typing import Dict, List
+from typing import Any, Dict, List
 import jwt
 import databases
-import sqlalchemy
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+
+# import json
+import sqlalchemy  # type: ignore
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from collections import defaultdict
 from dotenv import load_dotenv
-from icecream import ic
+from icecream import ic  # type: ignore
+from dataclasses import dataclass
+from dataclasses_json import dataclass_json
 
 load_dotenv()
 
@@ -29,8 +33,8 @@ whiteboards = sqlalchemy.Table(
     sqlalchemy.Column("created_at", sqlalchemy.DateTime),
 )
 
-engine = sqlalchemy.create_engine(database_url)
-metadata.create_all(engine)
+engine = sqlalchemy.create_engine(database_url)  # type: ignore
+metadata.create_all(engine)  # type: ignore
 
 app = FastAPI()
 app.add_middleware(
@@ -42,20 +46,8 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-async def startup():
-    print("connected to db")
-    await database.connect()
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    print("disconnected from db")
-    await database.disconnect()
-
-
 @app.middleware("auth")
-async def auth(request: Request, call_next):
+async def auth(request: Request, call_next) -> Response:  # type: ignore
     bearer = request.headers.get("Authorization")
     if not bearer:
         return JSONResponse(
@@ -75,7 +67,7 @@ async def auth(request: Request, call_next):
     except jwt.exceptions.PyJWTError:
         return JSONResponse(status_code=401, content={"message": "Invalid token"})
 
-    return await call_next(request)
+    return await call_next(request)  # type: ignore
 
 
 @app.get("/user")
@@ -91,8 +83,8 @@ async def hello(request: Request):
 @app.get("/whiteboards")
 async def get_whiteboards(request: Request):
     username = request.state.auth["preferred_username"]
-    query = whiteboards.select().where(whiteboards.c.owner == username)
-    return await database.fetch_all(query)
+    query = whiteboards.select().where(whiteboards.c.owner == username)  # type: ignore
+    return await database.fetch_all(query)  # type: ignore
 
 
 @app.post("/whiteboards/{name}")
@@ -103,18 +95,18 @@ async def create_whiteboard(request: Request, name: str):
         return JSONResponse(
             status_code=400, content={"message": "Name cannot be empty"}
         )
-    query = whiteboards.insert().values(name=name, owner=username)
-    return await database.execute(query)
+    query = whiteboards.insert().values(name=name, owner=username)  # type: ignore
+    return await database.execute(query)  # type: ignore
 
 
 @app.post("/whiteboards/{id}/delete")
 async def delete_whiteboard(request: Request, id: int):
     ic(id)
     username = request.state.auth["preferred_username"]
-    query = whiteboards.delete().where(
+    query = whiteboards.delete().where(  # type: ignore
         whiteboards.c.id == id and whiteboards.c.owner == username
     )
-    return await database.execute(query)
+    return await database.execute(query)  # type: ignore
 
 
 class ConnectionManager:
@@ -128,7 +120,7 @@ class ConnectionManager:
         self.active_connections[board_id].remove(websocket)
 
     async def send_personal_message(
-        self, message: Dict[str, str], websocket: WebSocket
+        self, message: Dict[str, Any], websocket: WebSocket
     ):
         await websocket.send_json(message)
 
@@ -137,8 +129,16 @@ class ConnectionManager:
             await connection.send_json(message)
 
 
+@dataclass
+@dataclass_json
+class Message:
+    username: str
+    content: str
+
+
 manager = ConnectionManager()
-whiteboard_lines = defaultdict(list)
+whiteboard_lines: Dict[int, Any] = defaultdict(list)
+chat: Dict[int, List[Dict[str, str]]] = defaultdict(list)
 
 
 @app.websocket("/whiteboard/{id}")
@@ -170,10 +170,26 @@ async def whiteboard(ws: WebSocket, id: int):
     await manager.send_personal_message(
         {"type": "lines", "lines": whiteboard_lines[id]}, ws
     )
-    # await manager.send_personal_message({"type": "chat_history", "chat": chat[id]}, ws)
+    await manager.send_personal_message(
+        {"type": "chat_history", "chat": [e for e in chat[id]]}, ws
+    )
     try:
         while True:
             data = await ws.receive_json()
+            if data.get("type") == "chat" and data.get("message"):
+                m = {
+                    "username": user["preferred_username"],
+                    "content": data.get("message"),
+                }
+                chat[id].append(m)
+                await manager.broadcast(
+                    {
+                        "type": "chat",
+                        "user": user["preferred_username"],
+                        "content": data.get("message"),
+                    },
+                    id,
+                )
             if data.get("type") == "lines" and data.get("lines"):
                 await manager.broadcast(
                     {
@@ -224,3 +240,25 @@ async def whiteboard(ws: WebSocket, id: int):
         await manager.broadcast(
             {"type": "leave", "user": user["preferred_username"]}, id
         )
+    except Exception as e:
+        ic(e)
+
+
+@app.on_event("startup")
+async def startup():
+    # global whiteboard_lines
+
+    await database.connect()
+    print("connected to db")
+
+    # with open("lines.json", "r") as f:
+    #     whiteboard_lines.update(json.loads(f.read()))
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
+    print("disconnected from db")
+
+    # with open("lines.json", "w") as f:
+    #     f.write(json.dumps(whiteboard_lines))
